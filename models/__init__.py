@@ -7,6 +7,8 @@ from compressai.models import (
     Cheng2020Attention,
 )
 
+from .HPCM_Base import HPCM_Base
+from .HPCM_Large import HPCM_Large
 
 image_models = {
     "factorized": FactorizedPrior,
@@ -20,3 +22,6 @@ image_models = {
 
 models = {}
 models.update(image_models)
+
+models["hpcm-base"] = HPCM_Base
+models["hpcm-large"] = HPCM_Large

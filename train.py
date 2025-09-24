@@ -183,8 +183,7 @@ def eval_epoch(model, criterion, eval_dataloader, epoch, accelerator, tb_writer=
 def save_checkpoint(state, is_best, filename):
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, filename[:-4] + "_best" + filename[-4:])
-
+        torch.save({"epoch":state['epoch'], "state_dict":state["state_dict"]}, os.path.join(os.path.dirname(filename), "best_model.tar"))
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Example training script.")
