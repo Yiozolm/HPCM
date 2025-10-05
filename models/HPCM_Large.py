@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 
 from compressai.ops import quantize_ste
-from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 
 from .Base import BaseWrapper
 
@@ -13,48 +12,10 @@ from .utils import (
     deconv2x2_up, 
     deconv4x4_up, 
     conv1x1,
-    DWConvRB,
+    y_spatial_prior_s1_s2, 
+    y_spatial_prior_s3,
     CrossAttentionCell, 
 )
-
-
-class y_spatial_prior_s1_s2(nn.Module):
-    def __init__(self, M):
-        super().__init__()
-        
-        self.branch_1 = nn.Sequential(
-            DWConvRB(M*3),
-            DWConvRB(M*3),
-        )
-        self.branch_2 = nn.Sequential(
-            DWConvRB(M*3),
-            DWConvRB(M*3),
-            conv1x1(3*M,2*M),
-        )
-
-    def forward(self, x, quant_step):
-        return self.branch_2(self.branch_1(x)*quant_step)
-
-
-class y_spatial_prior_s3(nn.Module):
-    def __init__(self, M):
-        super().__init__()
-        
-        self.branch_1 = nn.Sequential(
-            DWConvRB(M*3),
-            DWConvRB(M*3),
-            DWConvRB(M*3),
-            DWConvRB(M*3),
-        )
-        self.branch_2 = nn.Sequential(
-            DWConvRB(M*3),
-            DWConvRB(M*3),
-            DWConvRB(M*3),
-            conv1x1(3*M,2*M),
-        )
-
-    def forward(self, x, quant_step):
-        return self.branch_2(self.branch_1(x)*quant_step)
 
 
 class HPCM_Large(BaseWrapper):
@@ -139,9 +100,6 @@ class HPCM_Large(BaseWrapper):
         
         self.context_net = nn.ModuleList(conv1x1(2*M,2*M) for _ in range(2))
 
-        self.entropy_bottleneck = EntropyBottleneck(N)
-        self.gaussian_conditional = GaussianConditional(None)
-
     def forward(self, x):
         y = self.g_a(x)
         z = self.h_a(y)
@@ -206,7 +164,7 @@ class HPCM_Large(BaseWrapper):
             else:
                 y_hat_so_far = torch.sum(torch.stack(y_hat_list_s1), dim=0)
                 params = torch.cat((context_next, y_hat_so_far), dim=1)
-                context = y_spatial_prior_s1(y_spatial_prior_adaptor_list_s1[i - 1](params), adaptive_params_list[i - 1])
+                context = self.y_spatial_prior_s1_s2(self.y_spatial_prior_adaptor_list_s1[i - 1](params), self.adaptive_params_list[i - 1])
                 context_next = self.attn_s1(context, context_next)
                 scales, means = context.chunk(2, 1)
                 y_res_1, y_q_1, y_hat_1, s_hat_1 = self.process_with_mask(y_s1, scales, means, mask_list[i])
@@ -253,7 +211,7 @@ class HPCM_Large(BaseWrapper):
         for i in range(3):
             y_hat_so_far = torch.sum(torch.stack(y_hat_list_s2), dim=0)
             params = torch.cat((context_next, y_hat_so_far), dim=1)
-            context = y_spatial_prior_s2(y_spatial_prior_adaptor_list_s2[i - 1](params), adaptive_params_list[i + 1])
+            context = self.y_spatial_prior_s1_s2(self.y_spatial_prior_adaptor_list_s2[i - 1](params), self.adaptive_params_list[i + 1])
             context_next = self.attn_s2(context, context_next)
             scales, means = context.chunk(2, 1)
             y_res_1, y_q_1, y_hat_1, s_hat_1 = self.process_with_mask(y_s2, scales, means, mask_list[i])
@@ -299,7 +257,7 @@ class HPCM_Large(BaseWrapper):
         for i in range(6):
             y_hat_so_far = torch.sum(torch.stack(y_hat_list_s3), dim=0)
             params = torch.cat((context_next, y_hat_so_far), dim=1)
-            context = y_spatial_prior_s3(y_spatial_prior_adaptor_list_s3[i - 1](params), adaptive_params_list[i + 4])
+            context = self.y_spatial_prior_s3(self.y_spatial_prior_adaptor_list_s3[i - 1](params), self.adaptive_params_list[i + 4])
             context_next = self.attn_s3(context, context_next)
             scales, means = context.chunk(2, 1)
             y_res_1, y_q_1, y_hat_1, s_hat_1 = self.process_with_mask(y, scales, means, mask_list[i])
@@ -320,13 +278,13 @@ class HPCM_Large(BaseWrapper):
             return y_q_write_list_s1 + y_q_write_list_s2 + y_q_write_list_s3, scales_hat_write_list_s1 + scales_hat_write_list_s2 + scales_hat_write_list_s3
 
         return y_res, y_q, y_hat, scales_hat
-
+    
     def compress(self, x):
         y = self.g_a(x)
         z = self.h_a(y)
 
         z_strings = self.entropy_bottleneck.compress(z - self.means_hyper)
-        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:]) + self.means_hyper
+        z_hat = quantize_ste(z - self.means_hyper) + self.means_hyper
 
         params = self.h_s(z_hat)
 
@@ -337,14 +295,18 @@ class HPCM_Large(BaseWrapper):
                                         self.adaptive_params_list, self.context_net, write=True
                                         )
         
-        indexes = self.gaussian_conditional.build_indexes(scales_hat_write_list)
-        y_strings = self.gaussian_conditional.compress(y_q_write_list, indexes)
+        y_strings = list()
+        for i in range(len(y_q_write_list)):
+            indexes = self.gaussian_conditional.build_indexes(scales=scales_hat_write_list[i])
+            y_string = self.gaussian_conditional.compress(y_q_write_list[i], indexes)
+            y_strings.append(y_string)
 
         return {"strings": [y_strings, z_strings], "shape": z.size()[-2:]}
 
     
     def decompress(self, strings, shape):
         assert isinstance(strings, list) and len(strings) == 2
+
         z_hat = self.entropy_bottleneck.decompress(strings[1], shape) + self.means_hyper
 
         params = self.h_s(z_hat)
@@ -368,23 +330,26 @@ class HPCM_Large(BaseWrapper):
 
         mask_list = self.get_mask_two_parts(B, C, H // 4, W // 4, dtype, device)
 
+        string_idx = 0
         for i in range(2):
             if i == 0:
                 scales_r = self.combine_for_writing_s1(scales_s1 * mask_list[i])
-                indexes_r = self.gaussian_conditional.build_indexes(scales_r)
-                y_q_r = self.gaussian_conditional.decompress(strings[0], indexes, dtype)
+                indexes_r = self.gaussian_conditional.build_indexes(scales=scales_r)
+                y_q_r = self.gaussian_conditional.decompress(strings[0][string_idx], indexes_r, dtype).to(device)
                 y_hat_curr_step = (torch.cat([y_q_r for _ in range(2)], dim=1) + means_s1) * mask_list[i]
                 y_hat_so_far = y_hat_curr_step
+                string_idx += 1
             else:
                 params = torch.cat((context_next, y_hat_so_far), dim=1)
-                context = y_spatial_prior_s1(y_spatial_prior_adaptor_list_s1[i - 1](params), adaptive_params_list[i - 1])
+                context = self.y_spatial_prior_s1_s2(self.y_spatial_prior_adaptor_list_s1[i - 1](params), self.adaptive_params_list[i - 1])
                 context_next = self.attn_s1(context, context_next)
                 scales, means = context.chunk(2, 1)
                 scales_r = self.combine_for_writing_s1(scales * mask_list[i])
-                indexes_r = self.gaussian_conditional.build_indexes(scales_r)
-                y_q_r = self.gaussian_conditional.decompress(strings[0], indexes, dtype)
+                indexes_r = self.gaussian_conditional.build_indexes(scales=scales_r)
+                y_q_r = self.gaussian_conditional.decompress(strings[0][string_idx], indexes_r, dtype).to(device)
                 y_hat_curr_step = (torch.cat([y_q_r for _ in range(2)], dim=1) + means) * mask_list[i]
                 y_hat_so_far = y_hat_so_far + y_hat_curr_step
+                string_idx += 1
         
         y_hat_so_far = self.recon_for_s2_s3(y_hat_so_far, mask_list_rec_s2, B, C, H // 2, W // 2, dtype, device)
 
@@ -399,20 +364,21 @@ class HPCM_Large(BaseWrapper):
         means_s2 = self.get_s2_hyper_with_mask(means_all, mask_list_s1, mask_list_s2, mask_list_rec_s2, B, C, H // 2, W // 2, dtype, device)
         common_params_s2 = torch.cat((scales_s2, means_s2), dim=1)
         context += common_params_s2
-        context_next = context_net[0](context)
+        context_next = self.context_net[0](context)
 
         mask_list = self.get_mask_four_parts(B, C, H // 2, W // 2, dtype, device)[1:]
 
         for i in range(3):
             params = torch.cat((context_next, y_hat_so_far), dim=1)
-            context = y_spatial_prior_s2(y_spatial_prior_adaptor_list_s2[i - 1](params), adaptive_params_list[i + 1])
+            context = self.y_spatial_prior_s1_s2(self.y_spatial_prior_adaptor_list_s2[i - 1](params), self.adaptive_params_list[i + 1])
             context_next = self.attn_s2(context, context_next)
             scales, means = context.chunk(2, 1)
             scales_r = self.combine_for_writing_s2(scales * mask_list[i])
-            indexes_r = self.gaussian_conditional.build_indexes(scales_r)
-            y_q_r = self.gaussian_conditional.decompress(strings[0], indexes, dtype)
+            indexes_r = self.gaussian_conditional.build_indexes(scales=scales_r)
+            y_q_r = self.gaussian_conditional.decompress(strings[0][string_idx], indexes_r, dtype).to(device)
             y_hat_curr_step = (torch.cat([y_q_r for _ in range(4)], dim=1) + means) * mask_list[i]
             y_hat_so_far = y_hat_so_far + y_hat_curr_step
+            string_idx += 1
 
         y_hat_so_far = self.recon_for_s2_s3(y_hat_so_far, mask_list_s2, B, C, H, W, dtype, device)
 
@@ -426,20 +392,21 @@ class HPCM_Large(BaseWrapper):
         means_s3 = self.get_s3_hyper_with_mask(means_all, mask_list_s2, B, C, H, W, dtype, device)
         common_params_s3 = torch.cat((scales_s3, means_s3), dim=1)
         context += common_params_s3
-        context_next = context_net[1](context)
+        context_next = self.context_net[1](context)
 
         mask_list = self.get_mask_eight_parts(B, C, H, W, dtype, device)[2:]
 
         for i in range(6):
             params = torch.cat((context_next, y_hat_so_far), dim=1)
-            context = y_spatial_prior_s3(y_spatial_prior_adaptor_list_s3[i - 1](params), adaptive_params_list[i + 4])
+            context = self.y_spatial_prior_s3(self.y_spatial_prior_adaptor_list_s3[i - 1](params), self.adaptive_params_list[i + 4])
             context_next = self.attn_s3(context, context_next)
             scales, means = context.chunk(2, 1)
             scales_r = self.combine_for_writing_s3(scales * mask_list[i])
-            indexes_r = self.gaussian_conditional.build_indexes(scales_r)
-            y_q_r = self.gaussian_conditional.decompress(strings[0], indexes, dtype)
+            indexes_r = self.gaussian_conditional.build_indexes(scales=scales_r)
+            y_q_r = self.gaussian_conditional.decompress(strings[0][string_idx], indexes_r, dtype).to(device)
             y_hat_curr_step = (torch.cat([y_q_r for _ in range(8)], dim=1) + means) * mask_list[i]
             y_hat_so_far = y_hat_so_far + y_hat_curr_step
+            string_idx += 1
         
         y_hat = y_hat_so_far
     

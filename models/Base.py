@@ -1,9 +1,165 @@
 import torch
-
+import torch.nn as nn
+import math
 from compressai.models import CompressionModel
 from compressai.ops import quantize_ste
+from compressai.entropy_models import GaussianConditional
+import scipy
+import numpy as np
+import math
 
 
+def get_scale_table(min, max, levels):
+    """Returns table of logarithmically scales."""
+    return torch.exp(torch.linspace(math.log(min), math.log(max), levels))
+
+class generalnormalcdf(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, beta, y):
+        ctx.absy = torch.pow(torch.abs(y),beta)
+        ctx.beta = beta
+        output = (1+torch.sign(y)*torch.special.gammainc(1/beta, ctx.absy))/2
+        ctx.device = y.device
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        y = ctx.absy
+        beta = ctx.beta
+        y_grad = torch.exp(-y-torch.special.gammaln(1/beta))*beta/2
+        return None, grad_output*y_grad
+
+class GGM(GaussianConditional):
+    def __init__(self,
+        beta: float = 1.5,
+        scale_bound: float = 0.12,
+        process='y'  
+    ):
+        super().__init__(scale_bound=scale_bound, scale_table=None)
+        assert process in ('z', 'y')
+        self.process = process
+
+        # if self.process == 'y':
+        #     from .entropy_coders.unbounded_ans import ubransEncoder, ubransDecoder
+        #     self.encoder = ubransEncoder()
+        #     self.decoder = ubransDecoder()
+
+        if self.scale_table.numel() == 0:
+            self.scale_table = get_scale_table(0.12, 64, 60)
+
+        self.register_buffer("beta", torch.Tensor([beta]))
+
+    def _cdf(self, values):
+        return generalnormalcdf.apply(self.beta, values)
+
+    def _likelihood(self, inputs, scales, means=None):
+        
+        half = float(0.5)
+        if means is not None:
+            values = inputs - means
+        else:
+            values = inputs
+        scales = self.lower_bound_scale(scales)
+        upper = self._cdf((values+half)/scales)
+        lower = self._cdf((values-half)/scales)
+        likelihood = upper - lower
+
+        return likelihood
+
+    def _standardized_quantile(self, quantile):
+        return scipy.stats.gennorm.ppf(quantile, self.beta)
+
+    def update(self):
+        if hasattr(self, 'scales_hyper') and self.process == 'z':
+            scales = self.scales_hyper.detach().view(-1)
+            scales = self.lower_bound_scale(scales)
+
+            tail_mass = 1e-6
+            multiplier = -self._standardized_quantile(tail_mass / 2)
+            pmf_center = torch.ceil(scales * multiplier).int()
+            pmf_length = 2 * pmf_center + 1
+            max_length = torch.max(pmf_length).item()
+
+            device = scales.device
+            samples = torch.arange(max_length, device=device).int() - pmf_center[:, None]
+            samples = samples.float()
+            samples_scale = scales.unsqueeze(1)
+            samples_scale = samples_scale.float()
+
+            upper = self._cdf((samples+0.5) / samples_scale)
+            lower = self._cdf((samples-0.5) / samples_scale)
+            pmf = upper - lower
+
+            tail_mass = lower[:, :1] + (1-upper[:,-1:])
+
+            quantized_cdf = torch.Tensor(len(pmf_length), max_length + 2)
+            quantized_cdf = self._pmf_to_cdf(pmf, tail_mass, pmf_length, max_length)
+            self._quantized_cdf = quantized_cdf
+            self._offset = -pmf_center
+            self._cdf_length = pmf_length + 2
+        else:
+            if self.scale_table.numel() == 0:
+                self.scale_table = get_scale_table(0.12, 64, 60)
+
+            scale_table = self.lower_bound_scale(self.scale_table)
+
+            tail_mass = 1e-6
+            multiplier = -self._standardized_quantile(tail_mass / 2)
+            pmf_center = torch.ceil(scale_table * multiplier).int()
+            pmf_length = 2 * pmf_center + 1
+            max_length = torch.max(pmf_length).item()
+
+            device = scale_table.device
+            samples = torch.arange(max_length, device=device).int() - pmf_center[:, None]
+            samples = samples.float()
+            samples_scale = scale_table.unsqueeze(1)
+            samples_scale = samples_scale.float()
+
+            upper = self._cdf((samples+0.5) / samples_scale)
+            lower = self._cdf((samples-0.5) / samples_scale)
+            pmf = upper - lower
+
+            tail_mass = lower[:, :1] + (1-upper[:,-1:])
+
+            quantized_cdf = torch.Tensor(len(pmf_length), max_length + 2)
+            quantized_cdf = self._pmf_to_cdf(pmf, tail_mass, pmf_length, max_length)
+            self._quantized_cdf = quantized_cdf
+            self._offset = -pmf_center
+            self._cdf_length = pmf_length + 2
+
+        object.__setattr__(self, '_quantized_cdf', self._quantized_cdf)
+        object.__setattr__(self, '_offset', self._offset)
+        object.__setattr__(self, '_cdf_length', self._cdf_length)
+
+    @staticmethod
+    def _build_indexes(size):
+        dims: int = len(size)
+        N = size[0]
+        C = size[1]
+
+        view_dims = np.ones((dims,), dtype=np.int64)
+        view_dims[1] = -1
+        indexes = torch.arange(C).view(*view_dims)
+        indexes = indexes.int()
+
+        return indexes.repeat(N, 1, *size[2:])
+
+    def build_indexes(self, scales):
+        device = scales.device
+        scale_table = self.scale_table[:-1].to(device).view(1,1,1,1,-1)
+        scales_expand = scales.unsqueeze(-1)
+        indexes = (scales_expand>scale_table).sum(-1)
+        return indexes
+
+    def _get_medians(self):
+        medians = self.quantiles[:, :, 1:2]
+        return medians
+
+    @staticmethod
+    def _extend_ndims(tensor, n):
+        return tensor.reshape(-1, *([1] * n)) if n > 0 else tensor.reshape(-1)
+
+    
 class BaseWrapper(CompressionModel):
     def __init__(self):
         super().__init__()
@@ -12,7 +168,21 @@ class BaseWrapper(CompressionModel):
         self.mask_for_four_part = {}
         self.mask_for_eight_part = {}
         self.mask_for_rec_s2 = {}
-    
+
+        self.means_hyper = nn.Parameter(torch.zeros(1, 256, 1, 1))
+        self.scales_hyper = nn.Parameter(torch.ones(1, 256, 1, 1))
+
+        from compressai.entropy_models import EntropyBottleneck
+        self.entropy_bottleneck = EntropyBottleneck(256)
+        self.gaussian_conditional = GGM(process='y')
+        self.gaussian_conditional.scale_table = torch.Tensor() 
+
+    def update(self):
+        self.entropy_bottleneck.scales_hyper = self.scales_hyper
+        self.entropy_bottleneck.update()
+        print('entropy_bottleneck updated')
+        self.gaussian_conditional.update()
+        print('gaussian_conditional updated')
 
     def process_with_mask(self, y, scales, means, mask):
         scales_hat = scales * mask

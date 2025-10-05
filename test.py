@@ -201,7 +201,9 @@ def inference(model, x, recon_dir, name=None):
 
     metrics = compute_metrics(x, out_dec["x_hat"], 255)
     num_pixels = x.size(0) * x.size(2) * x.size(3)
-    bpp = sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels
+    y_bpp = sum(len(s[0]) if isinstance(s, list) else len(s) for s in out_enc["strings"][0]) * 8.0 / num_pixels
+    z_bpp = len(out_enc["strings"][1]) * 8.0 / num_pixels
+    bpp = y_bpp + z_bpp
 
     return {
         "psnr": metrics["psnr-rgb"],
